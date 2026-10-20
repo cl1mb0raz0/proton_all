@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proton All (pdrive-web) - Interactive Apps For Proton Drive, Built On Rclone.
 
-The Same Idea As `pdrive`, In The Browser: Browse The Drive, Download And Upload
+Browse The Drive In The Browser, Download And Upload
 Choosing Both What And Where, Pick A Conflict Policy, And See A --dry-run
 Preview Before Anything Moves.
 
@@ -52,7 +52,7 @@ MAX_BODY = 1 << 20
 LOG_KEEP = 2000        # Log Lines Kept Per Job
 JOBS_KEEP = 20         # Finished Jobs Kept In Memory
 
-# Same Flags As The `pdrive` Script.
+# Flags Shared By Every rclone Call.
 RCLONE_FLAGS = [
     "--protondrive-replace-existing-draft=true",
     "--transfers", "4",
@@ -842,8 +842,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(302, b"", "text/plain",
                                       [("Location", "/"), ("Set-Cookie", cookie)])
                 if not self.cookie_ok():
-                    raise ApiError(403, "Open the link printed in the terminal where "
-                                        "pdrive-web was started.")
+                    raise ApiError(403, "Open the link printed by ./up.sh or by "
+                                        "`docker compose logs pdrive`.")
                 return self.reply(200, (WEB_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
 
             if method == "GET" and url.path in STATIC:
@@ -853,7 +853,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if url.path.startswith("/api/"):
                 if not self.cookie_ok():
-                    raise ApiError(401, "Session expired. Open the link from the terminal again.")
+                    raise ApiError(401, "Session expired. Open the link from ./up.sh again.")
                 body = self.read_body() if method == "POST" else {}
                 return self.reply(200, self.api(method, url.path[5:], query, body))
 

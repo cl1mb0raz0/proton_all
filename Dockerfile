@@ -1,4 +1,4 @@
-# Proton All: Rclone + The Terminal Browser + The Local Web Ui, In One Image.
+# Proton All: Rclone + The Local Web Ui, In One Image.
 ARG RCLONE_VERSION=1.75.2
 FROM rclone/rclone:${RCLONE_VERSION} AS rclone
 
@@ -6,10 +6,10 @@ FROM python:3.12-slim
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 
 WORKDIR /app
-COPY pdrive pdrive-web pdrive-selftest /usr/local/bin/
+COPY pdrive-web pdrive-selftest /usr/local/bin/
 COPY webui /app/webui
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 755 /usr/local/bin/pdrive /usr/local/bin/pdrive-web /usr/local/bin/pdrive-selftest /usr/local/bin/entrypoint.sh \
+RUN chmod 755 /usr/local/bin/pdrive-web /usr/local/bin/pdrive-selftest /usr/local/bin/entrypoint.sh \
  && mkdir -p /config /data && chmod 777 /config /data
 
 # The Container User Is Chosen At Run Time (PUID/PGID In Compose) So Files Land

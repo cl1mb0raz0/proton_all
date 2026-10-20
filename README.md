@@ -2,7 +2,7 @@
 
 Interactive Apps For Proton Drive
 
-A Local Web Interface And A Terminal Browser For Proton Drive, Built On
+A Local Web Interface For Proton Drive, Built On
 [rclone](https://rclone.org) (Native `protondrive` Backend, 1.64 Or Newer).
 Browse The Drive, Download, Upload, Compare A Local Folder With A Proton Folder
 And Mirror One Way. Nothing Moves Without A `--dry-run` Preview First.
@@ -31,7 +31,6 @@ Without `up.sh`: `docker compose up -d --build`, Then Open The Link
   Are Off By Default And Need `DELETE`.
 - **Conflict Policies**: Overwrite If Different, Skip Existing, Overwrite If
   Newer, Keep Both (`name.old-<time>.ext`).
-- **Terminal**: `docker compose exec pdrive pdrive`.
 
 ## Safety
 
