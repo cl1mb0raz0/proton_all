@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# up.sh - Starts The Container And Opens The Browser On The Right Link.
-#
-# If Proton Has No Saved Session Yet, The Page Asks For The Login (User, Password,
-# Mfa Code) Straight Away. Usage:  ./up.sh
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 

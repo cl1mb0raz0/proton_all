@@ -1,7 +1,3 @@
-/* Proton All Ui. Design Tokens And Component Shapes Follow The Pvm Project's
-   docs/ui-design.md (Dark, Data-Dense, Teal Accent). Fonts Are Used Only If
-   Installed Locally: Nothing Is Fetched From The Network. */
-
 :root {
   --bg: #0A0D12;
   --surface: #12161D;

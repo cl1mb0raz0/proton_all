@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# pdrive-selftest - Checks How Proton Drive Really Behaves, With A Throwaway Folder.
-#
-# Verifies What Proton All Relies On: A Saved Session, Original Modification Times
-# After Upload And Download, The "Keep Both" Suffix And The Speed Of A Recursive
-# Listing. Everything Is Created Under proton-all-selftest-<time> And Deleted At The End.
-# Usage:  docker compose exec pdrive pdrive-selftest
 set -uo pipefail
 
 RCLONE="${PDRIVE_RCLONE:-rclone}"

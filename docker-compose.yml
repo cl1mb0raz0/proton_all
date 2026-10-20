@@ -4,21 +4,16 @@ services:
     image: pdrive:latest
     pull_policy: build
     restart: unless-stopped
-    # Files Created In The Data Folder Belong To You, Not To Root.
     user: "${PUID:-1000}:${PGID:-1000}"
     environment:
-      # Only What Is Listed Here Reaches The Container, Not The Whole .env File.
       PDRIVE_KEY: "${PDRIVE_KEY:-}"
       PDRIVE_PUBLIC_PORT: "${PDRIVE_PORT:-8765}"
-      # Shown In The Interface Next To /data, So You Know Which Folder It Is.
       PDRIVE_LOCAL_LABEL: "${PDRIVE_DATA_DIR}"
     ports:
       # Loopback Only: The Interface Is Not Reachable From The Network.
       - "127.0.0.1:${PDRIVE_PORT:-8765}:8765"
     volumes:
-      # The Top Folder Proton All May Read From And Write To.
       - "${PDRIVE_DATA_DIR:?Set PDRIVE_DATA_DIR in .env}:/data"
-      # Rclone Config And The Proton Session, Kept Between Restarts.
       - pdrive-config:/config
 
 volumes:
