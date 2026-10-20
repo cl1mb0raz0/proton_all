@@ -950,6 +950,21 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(404, "Unknown job.")
                 job.cancel()
                 return {"ok": True}
+            if route == "jobs/clear":
+                with JOBS_MU:
+                    for jid in [i for i, j in JOBS.items() if j.state != "running"]:
+                        JOBS.pop(jid)
+                return {"ok": True}
+            m = re.fullmatch(r"jobs/([0-9a-f]+)/delete", route)
+            if m:
+                with JOBS_MU:
+                    job = JOBS.get(m.group(1))
+                    if not job:
+                        raise ApiError(404, "Unknown job.")
+                    if job.state == "running":
+                        raise ApiError(409, "This transfer is still running. Cancel it first.")
+                    JOBS.pop(job.id)
+                return {"ok": True}
             if route == "quit":
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return {"ok": True}

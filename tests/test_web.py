@@ -299,6 +299,17 @@ class Server(unittest.TestCase):
         self.assertEqual(self.drive_files(), ["Docs/a.txt", "Docs/c.txt"])
         self.assertEqual(sorted(p.name for p in (self.root / "work").iterdir()), ["a.txt", "c.txt"])
 
+    def test_transfer_history_can_be_deleted(self):
+        self.reset_data(); self.login()
+        a = self.wait_job(self.mirror_body(confirm="DELETE", dry_run=True))
+        b = self.wait_job(self.mirror_body(confirm="DELETE", dry_run=True))
+        self.assertEqual(self.api("jobs/" + a["id"] + "/delete", {})[0], 200)
+        self.assertEqual(self.api("jobs/" + a["id"])[0], 404)
+        self.assertEqual(self.api("jobs/" + a["id"] + "/delete", {})[0], 404)
+        self.assertEqual(self.api("jobs/" + b["id"])[0], 200)
+        self.assertEqual(self.api("jobs/clear", {})[0], 200)
+        self.assertEqual(self.api("jobs")[1]["jobs"], [])
+
     def test_mirror_to_local_deletes_only_local_files(self):
         self.reset_data(); self.login()
         (self.root / "work/only_here.txt").write_text("x")

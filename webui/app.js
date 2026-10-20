@@ -789,13 +789,22 @@ const jobsView = {
         h("td", { text: label }),
         h("td", { class: "mono muted nowrap", text: new Date(j.created * 1000).toLocaleString() }),
         h("td", { class: "mono" }, j.steps.length + (j.steps.length === 1 ? " step" : " steps")),
-        h("td", {}, h("button", { class: "btn btn-ghost btn-sm", type: "button", text: "Details", onclick: () => this.details(j.id) })));
+        h("td", { class: "nowrap" },
+          h("button", { class: "btn btn-ghost btn-sm", type: "button", text: "Details", onclick: () => this.details(j.id) }),
+          j.state === "running" ? null
+            : h("button", { class: "btn btn-danger-ghost btn-sm", type: "button", text: "Delete", onclick: () => this.remove(`jobs/${j.id}/delete`) })));
     });
+    const finished = this.jobs.some((j) => j.state !== "running");
     root.replaceChildren(
-      h("div", { class: "page-head" }, h("div", {}, h("h1", { text: "Transfers" }), h("p", { text: "Operations since pdrive-web was started." }))),
+      h("div", { class: "page-head" }, h("div", {}, h("h1", { text: "Transfers" }), h("p", { text: "Operations since pdrive-web was started." })),
+        finished ? h("button", { class: "btn btn-danger-ghost", type: "button", text: "Delete All", onclick: () => this.remove("jobs/clear") }) : null),
       h("div", { class: "card" }, rows.length
         ? h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ["State", "Kind", "Started", "Steps", ""].map((t) => h("th", { text: t })))), h("tbody", {}, rows)))
         : h("div", { class: "empty", text: "Nothing yet." })));
+  },
+  async remove(route) {
+    try { await api(route, {}); } catch (e) { say(e.message, "error"); }
+    this.refresh();
   },
   async details(id) {
     const s = await api("jobs/" + id);
