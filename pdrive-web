@@ -1,0 +1,1011 @@
+#!/usr/bin/env python3
+"""Proton All (pdrive-web) - Interactive Apps For Proton Drive, Built On Rclone.
+
+The Same Idea As `pdrive`, In The Browser: Browse The Drive, Download And Upload
+Choosing Both What And Where, Pick A Conflict Policy, And See A --dry-run
+Preview Before Anything Moves.
+
+Serves On 127.0.0.1 Only. Standard Library Only (Python 3.9+), No Pip Install.
+Requests Are Accepted Only With The Session Cookie That The One-Time Link
+Printed At Startup Sets, From A Loopback Host, So Neither Another Local User
+Nor A Web Page Open In The Browser Can Drive It.
+"""
+
+import argparse
+import hmac
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import webbrowser
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+# ----------------------------------------------------------------- Configuration
+HERE = Path(__file__).resolve().parent
+RCLONE_BIN = os.environ.get("PDRIVE_RCLONE") or str(Path.home() / ".local/bin/rclone")
+REMOTE = os.environ.get("PDRIVE_REMOTE", "")
+LOCAL_DEFAULT = os.environ.get("PDRIVE_LOCAL") or str(Path.home() / "ProtonDrive")
+DEFAULT_PORT = 8765
+# Container Use: Bind To All Interfaces Inside It (The Host Publishes The Port On
+# Loopback Only), Accept The Host-Side Port In The Host Check, And Keep Every
+# Local Path Under One Folder.
+BIND_HOST = os.environ.get("PDRIVE_HOST", "127.0.0.1")
+PUBLIC_PORT = os.environ.get("PDRIVE_PUBLIC_PORT", "")
+FIXED_KEY = os.environ.get("PDRIVE_KEY", "")
+LOCAL_ROOT = (Path(os.path.realpath(os.environ["PDRIVE_LOCAL_ROOT"]))
+              if os.environ.get("PDRIVE_LOCAL_ROOT") else None)
+SETTINGS_FILE = Path(os.environ.get("PDRIVE_SETTINGS")
+                     or Path.home() / ".config/pdrive-web/settings.json")
+DEFAULT_REMOTE = "proton"
+MAX_BODY = 1 << 20
+LOG_KEEP = 2000        # Log Lines Kept Per Job
+JOBS_KEEP = 20         # Finished Jobs Kept In Memory
+
+# Same Flags As The `pdrive` Script.
+RCLONE_FLAGS = [
+    "--protondrive-replace-existing-draft=true",
+    "--transfers", "4",
+    "--checkers", "8",
+    "--retries", "3",
+    "--low-level-retries", "10",
+]
+
+STATIC = {
+    "/style.css": "style.css",
+    "/app.js": "app.js",
+    "/logo.png": "logo.png",
+    "/favicon.png": "favicon.png",
+}
+
+
+def find_webui():
+    candidates = [os.environ.get("PDRIVE_WEBUI"), HERE / "webui",
+                  Path.home() / ".local/share/pdrive-web/webui"]
+    for c in candidates:
+        if c and (Path(c) / "index.html").is_file():
+            return Path(c)
+    sys.exit("webui/ folder not found next to pdrive-web (set PDRIVE_WEBUI).")
+
+
+WEB_DIR = find_webui()
+
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+# -------------------------------------------------------------------------- Rclone
+class Rclone:
+    """Runs Rclone One Command At A Time.
+
+    Proton Rotates Session Tokens, So Two Rclone Processes Using The Same
+    Config At Once Are Asked To Wait (409) Instead Of Racing Each Other.
+    """
+
+    def __init__(self, binary):
+        self.bin = binary
+        self.lock = threading.Lock()
+        self.remote = REMOTE
+        self.version = ""
+
+    def locate(self):
+        for cand in (self.bin, shutil.which("rclone")):
+            if not cand or not os.access(cand, os.X_OK):
+                continue
+            out = subprocess.run([cand, "help", "backends"], capture_output=True, text=True)
+            if "protondrive" in out.stdout.lower():
+                self.bin = cand
+                self.version = subprocess.run([cand, "version"], capture_output=True,
+                                              text=True).stdout.splitlines()[0]
+                return True
+        return False
+
+    def remotes(self):
+        out = subprocess.run([self.bin, "config", "dump"], capture_output=True, text=True)
+        try:
+            data = json.loads(out.stdout or "{}")
+        except ValueError:
+            return []
+        return sorted(n for n, c in data.items() if c.get("type") == "protondrive")
+
+    def pick_remote(self):
+        if self.remote:
+            return
+        found = self.remotes()
+        self.remote = found[0] if found else DEFAULT_REMOTE
+
+    def spec(self, path):
+        parts = [p for p in path.split("/") if p]
+        if any(p in (".", "..") for p in parts) or "\0" in path:
+            raise ApiError(400, "Invalid remote path.")
+        return f"{self.remote}:{'/'.join(parts)}"
+
+    def config(self):
+        """The Saved Settings Of The Remote ({} If It Does Not Exist)."""
+        out = subprocess.run([self.bin, "config", "dump"], capture_output=True, text=True)
+        try:
+            return json.loads(out.stdout or "{}").get(self.remote, {})
+        except ValueError:
+            return {}
+
+    def logged_in(self):
+        """True When The Remote Exists And Holds A Saved Proton Session."""
+        cfg = self.config()
+        return cfg.get("type") == "protondrive" and bool(cfg.get("client_refresh_token"))
+
+    def account(self):
+        return self.config().get("username", "")
+
+    def _exec(self, args, **kw):
+        return subprocess.run([self.bin, *args], capture_output=True, text=True,
+                              errors="replace", **kw)
+
+    def obscure(self, secret):
+        return self._exec(["obscure", "-"], input=secret, timeout=30).stdout.strip()
+
+    def login(self, username, password, mailbox, code):
+        """Creates The Remote From The Form And Logs In Once.
+
+        The 2FA Code Goes Only To The Environment Of That One Rclone Run. A Failed
+        Attempt Leaves No Remote Behind.
+        """
+        if not username or len(username) > 254 or re.search(r"\s", username):
+            raise ApiError(400, "Enter your Proton username or email address.")
+        if not password or "\0" in password or "\0" in mailbox:
+            raise ApiError(400, "Enter your Proton password.")
+        if code and not re.fullmatch(r"\d{6}", code):
+            raise ApiError(400, "The code has 6 digits.")
+        if not self.lock.acquire(blocking=False):
+            raise ApiError(409, "A transfer is running. Wait for it to finish.")
+        try:
+            self._exec(["config", "delete", self.remote], timeout=30)
+            args = ["config", "create", self.remote, "protondrive", f"username={username}",
+                    f"password={self.obscure(password)}"]
+            if mailbox:
+                args.append(f"mailbox_password={self.obscure(mailbox)}")
+            made = self._exec([*args, "--no-obscure"], timeout=60)
+            if made.returncode != 0:
+                raise ApiError(502, "Could not save the login.")
+            env = dict(os.environ)
+            if code:
+                env["RCLONE_CONFIG_" + re.sub(r"\W", "_", self.remote).upper() + "_2FA"] = code
+            try:
+                res = self._exec(["lsd", self.spec("/"), "--max-depth", "1", *RCLONE_FLAGS,
+                                  "--retries", "1", "--low-level-retries", "1"],
+                                 env=env, timeout=120)
+            except subprocess.TimeoutExpired:
+                res = None
+            ok = res is not None and res.returncode == 0 and self.logged_in()
+            if not ok:
+                self._exec(["config", "delete", self.remote], timeout=30)
+                text = res.stderr if res is not None else "rclone took too long."
+                if "429" in text:
+                    raise ApiError(429, "Proton asks to wait before more attempts. "
+                                        "Try again in a few minutes.")
+                tail = [ln for ln in text.strip().splitlines() if ln][-2:]
+                raise ApiError(401, " ".join(tail) or "Login failed.")
+        finally:
+            self.lock.release()
+
+    def logout(self):
+        """Forgets The Account And Its Saved Session On This Machine."""
+        if not self.lock.acquire(blocking=False):
+            raise ApiError(409, "A transfer is running. Wait for it to finish.")
+        try:
+            self._exec(["config", "delete", self.remote], timeout=30)
+        finally:
+            self.lock.release()
+
+    def run(self, args, timeout=600, env=None, extra=()):
+        if not self.lock.acquire(blocking=False):
+            raise ApiError(409, "A transfer is running. Wait for it to finish.")
+        try:
+            res = subprocess.run([self.bin, *args, *RCLONE_FLAGS, *extra], capture_output=True,
+                                 text=True, errors="replace", timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            raise ApiError(504, "rclone took too long.")
+        finally:
+            self.lock.release()
+        if res.returncode != 0:
+            tail = [ln for ln in res.stderr.strip().splitlines() if ln][-3:]
+            raise ApiError(502, " ".join(tail) or f"rclone exited with code {res.returncode}.")
+        return res.stdout
+
+
+rc = Rclone(RCLONE_BIN)
+
+
+# ---------------------------------------------------------------------------- Jobs
+CONFLICTS = {
+    1: ([], "overwrite if different"),
+    2: (["--ignore-existing"], "skip existing"),
+    3: (["--update"], "only if newer"),
+    4: (None, "keep both"),    # suffix carries a timestamp, built per job
+}
+
+
+def conflict_flags(choice):
+    if choice not in CONFLICTS:
+        raise ApiError(400, "Unknown conflict policy.")
+    flags, label = CONFLICTS[choice]
+    if flags is None:
+        flags = ["--suffix", ".old-" + time.strftime("%Y%m%d-%H%M%S"), "--suffix-keep-extension"]
+    return flags, label
+
+
+class Job:
+    def __init__(self, kind, dry_run, steps, flags):
+        self.id = uuid.uuid4().hex[:12]
+        self.kind = kind
+        self.dry_run = dry_run
+        self.steps = steps          # [{"desc", "args", "state", "progress"}]
+        self.flags = flags
+        self.state = "running"      # running | done | failed | cancelled
+        self.created = time.time()
+        self.finished = None
+        self.log = []
+        self.log_total = 0
+        self.cancel_requested = False
+        self.proc = None
+        self.cleanup = []           # Temp Files Removed When The Job Ends
+        self.mu = threading.Lock()
+
+    def add_log(self, line):
+        with self.mu:
+            self.log.append(line)
+            self.log_total += 1
+            if len(self.log) > LOG_KEEP:
+                del self.log[: len(self.log) - LOG_KEEP]
+
+    def snapshot(self, tail=300):
+        with self.mu:
+            return {
+                "id": self.id, "kind": self.kind, "dry_run": self.dry_run,
+                "state": self.state, "created": self.created, "finished": self.finished,
+                "steps": [{"desc": s["desc"], "state": s["state"], "progress": s["progress"]}
+                          for s in self.steps],
+                "log": self.log[-tail:], "log_total": self.log_total,
+            }
+
+    def cancel(self):
+        self.cancel_requested = True
+        proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+    def run(self):
+        failed = False
+        try:
+            for step in self.steps:
+                if self.cancel_requested:
+                    step["state"] = "skipped"
+                    continue
+                step["state"] = "running"
+                code = self._run_step(step)
+                if self.cancel_requested:
+                    step["state"] = "cancelled"
+                elif code == 0:
+                    step["state"] = "done"
+                else:
+                    step["state"] = "failed"
+                    failed = True
+        finally:
+            with self.mu:
+                self.state = ("cancelled" if self.cancel_requested
+                              else "failed" if failed else "done")
+                self.finished = time.time()
+            for f in self.cleanup:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+            if not self.dry_run and not self.kind.startswith("download"):
+                invalidate_remote()
+            rc.lock.release()
+
+    def _run_step(self, step):
+        cmd = [rc.bin, *step["args"], *RCLONE_FLAGS, *self.flags,
+               "--use-json-log", "-v", "--stats", "1s"]
+        if self.dry_run:
+            cmd.append("--dry-run")
+        self.add_log("$ " + step["desc"])
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                         text=True, errors="replace", bufsize=1)
+        except OSError as e:
+            self.add_log(f"cannot start rclone: {e}")
+            return 1
+        for raw in self.proc.stderr:
+            self._parse(raw.rstrip("\n"), step)
+        return self.proc.wait()
+
+    def _parse(self, raw, step):
+        if not raw:
+            return
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            self.add_log(raw)
+            return
+        stats = d.get("stats")
+        if stats:
+            with self.mu:
+                step["progress"] = {
+                    "bytes": stats.get("bytes", 0), "total": stats.get("totalBytes", 0),
+                    "speed": stats.get("speed", 0), "eta": stats.get("eta"),
+                    "done": stats.get("transfers", 0), "count": stats.get("totalTransfers", 0),
+                }
+            return
+        msg = d.get("msg", "")
+        if d.get("object"):
+            msg = f"{d['object']}: {msg}"
+        if msg:
+            self.add_log(msg if d.get("level") in ("info", "notice") else f"[{d.get('level')}] {msg}")
+
+
+JOBS = {}
+JOBS_MU = threading.Lock()
+
+
+def start_job(job):
+    if not rc.lock.acquire(blocking=False):
+        raise ApiError(409, "Another operation is running. Wait for it to finish.")
+    with JOBS_MU:
+        JOBS[job.id] = job
+        done = [j for j in JOBS.values() if j.state != "running"]
+        for old in sorted(done, key=lambda j: j.created)[:-JOBS_KEEP]:
+            JOBS.pop(old.id, None)
+    threading.Thread(target=job.run, daemon=True).start()
+    return job
+
+
+def load_settings():
+    try:
+        data = json.loads(SETTINGS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(data):
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, SETTINGS_FILE)
+
+
+def sync_dir():
+    """The Saved Local Folder, If It Is Still There And Still Allowed."""
+    value = load_settings().get("sync_dir", "")
+    try:
+        p = local_path(value)
+    except ApiError:
+        return ""
+    return str(p) if p.is_dir() else ""
+
+
+def require_login():
+    if not rc.logged_in():
+        raise ApiError(401, "Not logged in to Proton. Use In to log in.")
+
+
+def clean_name(name):
+    if not isinstance(name, str) or not name or "/" in name or "\0" in name or name in (".", ".."):
+        raise ApiError(400, "Invalid name.")
+    return name
+
+
+def local_path(value, must_exist=True):
+    if not isinstance(value, str) or not value.startswith("/") or "\0" in value:
+        raise ApiError(400, "Local paths must be absolute.")
+    p = Path(os.path.normpath(value))
+    if LOCAL_ROOT is not None:
+        real = Path(os.path.realpath(p))
+        if real != LOCAL_ROOT and LOCAL_ROOT not in real.parents:
+            raise ApiError(403, f"Outside the allowed folder ({LOCAL_ROOT}).")
+    if must_exist and not p.exists():
+        raise ApiError(400, f"Does not exist: {p}")
+    return p
+
+
+def check_rel_paths(paths):
+    if not isinstance(paths, list):
+        raise ApiError(400, "Invalid list of paths.")
+    for p in paths:
+        if (not isinstance(p, str) or not p or p.startswith("/") or "\0" in p
+                or "\n" in p or "\r" in p
+                or any(seg in ("", ".", "..") for seg in p.split("/"))):
+            raise ApiError(400, f"Invalid path: {p!r}")
+    return paths
+
+
+def write_list(paths, job):
+    fd, name = tempfile.mkstemp(prefix="pdrive-files-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(paths) + "\n")
+    job.cleanup.append(name)
+    return name
+
+
+def build_files_job(body, kind):
+    """Copy Only The Listed Relative Paths Between A Local And A Remote Folder.
+
+    `delete_paths` (Files That Exist Only At The Destination) Makes It A Mirror: They
+    Are Removed Afterwards, And Only With The Confirmation Word.
+    """
+    paths = check_rel_paths(body.get("paths") or [])
+    doomed = check_rel_paths(body.get("delete_paths") or [])
+    if not paths and not doomed:
+        raise ApiError(400, "Nothing selected.")
+    if doomed and body.get("confirm") != "DELETE":
+        raise ApiError(400, "Type DELETE to confirm.")
+    flags, label = conflict_flags(body.get("conflict", 1))
+    local = local_path(body.get("local_dir"))
+    if not local.is_dir():
+        raise ApiError(400, f"Not a directory: {local}")
+    remote = rc.spec(str(body.get("remote_dir", "/")))
+    src, dst = (str(local), remote) if kind == "upload_files" else (remote, str(local))
+    job = Job(kind, bool(body.get("dry_run")), [], flags)
+    if paths:
+        job.steps.append({"desc": f"{len(paths)} file{'s' if len(paths) != 1 else ''}: {src} -> {dst}  [{label}]",
+                          "args": ["copy", src, dst, "--files-from-raw", write_list(paths, job)]})
+    if doomed:
+        job.steps.append({"desc": f"delete {len(doomed)} file{'s' if len(doomed) != 1 else ''} only in {dst}",
+                          "args": ["delete", dst, "--files-from-raw", write_list(doomed, job)]})
+    for st in job.steps:
+        st["state"] = "pending"
+        st["progress"] = None
+    return job
+
+
+def build_job(body):
+    kind = body.get("kind")
+    if kind in ("upload_files", "download_files"):
+        return build_files_job(body, kind)
+    items = body.get("items")
+    if kind not in ("download", "upload", "delete") or not isinstance(items, list) or not items:
+        raise ApiError(400, "Nothing selected.")
+    dry_run = bool(body.get("dry_run"))
+    steps, flags = [], []
+
+    if kind == "delete":
+        if body.get("confirm") != "DELETE":
+            raise ApiError(400, "Type DELETE to confirm.")
+        dry_run = False
+        for it in items:
+            path = str(it.get("path", ""))
+            name = clean_name(path.rstrip("/").split("/")[-1])
+            is_dir = bool(it.get("is_dir"))
+            steps.append({"desc": f"delete {'directory ' if is_dir else ''}{name}",
+                          "args": ["purge" if is_dir else "deletefile", rc.spec(path)]})
+    else:
+        flags, label = conflict_flags(body.get("conflict", 1))
+        if kind == "download":
+            dest = local_path(body.get("dest"), must_exist=False)
+            if not dest.is_dir():
+                if not body.get("create_dest"):
+                    raise ApiError(400, f"Destination does not exist: {dest}")
+                if not dry_run:
+                    try:
+                        dest.mkdir(parents=True, exist_ok=True)
+                    except OSError as e:
+                        raise ApiError(400, f"Cannot create {dest}: {e.strerror}")
+            for it in items:
+                path = str(it.get("path", ""))
+                name = clean_name(path.rstrip("/").split("/")[-1])
+                if it.get("is_dir"):
+                    steps.append({"desc": f"{name}/ -> {dest / name}  [{label}]",
+                                  "args": ["copy", rc.spec(path), str(dest / name),
+                                           "--create-empty-src-dirs"]})
+                else:
+                    steps.append({"desc": f"{name} -> {dest}/  [{label}]",
+                                  "args": ["copy", rc.spec(path), str(dest)]})
+        else:
+            target = str(body.get("dest", ""))
+            for it in items:
+                src = local_path(it.get("path"))
+                name = clean_name(src.name)
+                if src.is_dir():
+                    steps.append({"desc": f"{src}/ -> /{target.strip('/')}/{name}  [{label}]",
+                                  "args": ["copy", str(src), rc.spec(f"{target}/{name}"),
+                                           "--create-empty-src-dirs"]})
+                else:
+                    steps.append({"desc": f"{src} -> /{target.strip('/')}  [{label}]",
+                                  "args": ["copy", str(src), rc.spec(target)]})
+
+    for s in steps:
+        s["state"] = "pending"
+        s["progress"] = None
+    return Job(kind, dry_run, steps, flags)
+
+
+# ----------------------------------------------------------------------- Compare
+COMPARE_CAP = 30000     # Entries Sent To The Browser
+TIME_WINDOW = 2.0       # Seconds: Modification Times Closer Than This Are Equal
+ISO_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)?$")
+
+
+def parse_time(text):
+    m = ISO_RE.match(text or "")
+    if not m:
+        return None
+    base, frac, tz = m.groups()
+    tz = "+00:00" if tz in (None, "Z") else tz
+    try:
+        return datetime.fromisoformat(f"{base}.{((frac or '') + '000000')[:6]}{tz}").timestamp()
+    except ValueError:
+        return None
+
+
+def scan_local(root):
+    found = {}
+    for dirpath, _dirs, names in os.walk(root, followlinks=False):
+        for name in names:
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if not os.path.isfile(full) or os.path.islink(full):
+                continue        # Rclone Does Not Follow Links Either
+            found[os.path.relpath(full, root).replace(os.sep, "/")] = (st.st_size, st.st_mtime)
+            if len(found) > 200000:
+                raise ApiError(413, "Too many files to compare (over 200000).")
+    return found
+
+
+REMOTE_CACHE = {}       # Remote Folder -> {"at", "took", "exists", "files"}
+CACHE_MU = threading.Lock()
+CACHE_TTL = 300         # Seconds A Listing Of Proton Stays Valid
+
+
+def norm_dir(path):
+    return "/" + "/".join(p for p in path.split("/") if p)
+
+
+def invalidate_remote():
+    with CACHE_MU:
+        REMOTE_CACHE.clear()
+
+
+def cached_remote(path):
+    """A Recent Listing Of This Folder, Or Of A Folder Above It, Else None."""
+    want = norm_dir(path)
+    now = time.time()
+    with CACHE_MU:
+        for root, c in REMOTE_CACHE.items():
+            if now - c["at"] > CACHE_TTL:
+                continue
+            if root == want:
+                return c["files"], c["exists"], c["at"]
+            if root == "/" or want.startswith(root + "/"):
+                prefix = want[len(root):].strip("/") + "/" if root != "/" else want.strip("/") + "/"
+                sub = {k[len(prefix):]: v for k, v in c["files"].items() if k.startswith(prefix)}
+                if sub:
+                    return sub, True, c["at"]
+    return None
+
+
+def last_scan_seconds(path):
+    with CACHE_MU:
+        c = REMOTE_CACHE.get(norm_dir(path))
+    return c["took"] if c else None
+
+
+def scan_remote(path, scan):
+    """One Recursive Listing, Run As A Child Process That Can Be Cancelled."""
+    if scan.cancel_requested:
+        raise ApiError(499, "Cancelled.")
+    cmd = [rc.bin, "lsjson", "-R", "--files-only", "--no-mimetype", rc.spec(path), *RCLONE_FLAGS]
+    scan.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, errors="replace")
+    try:
+        out, err = scan.proc.communicate(timeout=3600)
+    except subprocess.TimeoutExpired:
+        scan.proc.kill()
+        raise ApiError(504, "rclone took too long.")
+    if scan.cancel_requested:
+        raise ApiError(499, "Cancelled.")
+    if scan.proc.returncode != 0:
+        if "directory not found" in err.lower():
+            return {}, False
+        tail = [ln for ln in err.strip().splitlines() if ln][-3:]
+        raise ApiError(502, " ".join(tail) or f"rclone exited with code {scan.proc.returncode}.")
+    return {e["Path"]: (e["Size"], parse_time(e.get("ModTime"))) for e in json.loads(out or "[]")}, True
+
+
+class Scan:
+    """Reads Both Sides Of A Compare In The Background, With Progress And Cancel."""
+
+    def __init__(self, local_dir, remote_dir, refresh):
+        self.id = uuid.uuid4().hex[:12]
+        self.local_dir, self.remote_dir, self.refresh = local_dir, remote_dir, refresh
+        self.state = "running"      # running | done | failed | cancelled
+        self.phase = "Reading the local folder"
+        self.started = time.time()
+        self.finished = None
+        self.error = ""
+        self.cached_at = None
+        self.expected = last_scan_seconds(remote_dir)
+        self.local, self.remote, self.remote_exists = {}, {}, True
+        self.proc = None
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+
+    def run(self):
+        try:
+            self.local = scan_local(local_path(self.local_dir))
+            hit = None if self.refresh else cached_remote(self.remote_dir)
+            if hit:
+                self.remote, self.remote_exists, self.cached_at = hit
+            else:
+                self.phase = "Reading Proton Drive"
+                t0 = time.time()
+                self.remote, self.remote_exists = scan_remote(self.remote_dir, self)
+                with CACHE_MU:
+                    REMOTE_CACHE[norm_dir(self.remote_dir)] = {
+                        "at": time.time(), "took": time.time() - t0,
+                        "exists": self.remote_exists, "files": self.remote}
+            self.state = "done"
+        except ApiError as e:
+            self.state = "cancelled" if self.cancel_requested else "failed"
+            self.error = e.message
+        except Exception as e:
+            self.state = "failed"
+            self.error = f"{type(e).__name__}: {e}"
+        finally:
+            self.finished = time.time()
+            rc.lock.release()
+
+    def snapshot(self, ignore_time=False):
+        out = {"id": self.id, "state": self.state, "phase": self.phase, "error": self.error,
+               "elapsed": (self.finished or time.time()) - self.started,
+               "expected": self.expected, "cached_at": self.cached_at}
+        if self.state == "done":
+            out["result"] = build_result(self, ignore_time)
+        return out
+
+
+SCANS = {}
+
+
+def start_scan(local_dir, remote_dir, refresh):
+    local_path(local_dir)           # Fail Early On A Bad Folder
+    if not rc.lock.acquire(blocking=False):
+        raise ApiError(409, "Another operation is running. Wait for it to finish.")
+    scan = Scan(local_dir, remote_dir, refresh)
+    for old in sorted(SCANS.values(), key=lambda x: x.started)[:-4]:
+        SCANS.pop(old.id, None)
+    SCANS[scan.id] = scan
+    threading.Thread(target=scan.run, daemon=True).start()
+    return scan
+
+
+def classify(loc, rem, ignore_time):
+    if loc and not rem:
+        return "only_local"
+    if rem and not loc:
+        return "only_remote"
+    (ls, lm), (rs, rm) = loc, rem
+    diff = None if lm is None or rm is None else lm - rm
+    close = diff is None or abs(diff) <= TIME_WINDOW
+    if ls == rs and (ignore_time or close):
+        return "same"
+    if close:
+        return "differs"
+    return "local_newer" if diff > 0 else "remote_newer"
+
+
+def build_result(scan, ignore_time):
+    local, remote = scan.local, scan.remote
+    counts = {k: 0 for k in ("only_local", "only_remote", "local_newer", "remote_newer", "differs", "same")}
+    entries = []
+    for rel in sorted(set(local) | set(remote), key=str.casefold):
+        st = classify(local.get(rel), remote.get(rel), ignore_time)
+        counts[st] += 1
+        l, r = local.get(rel), remote.get(rel)
+        entries.append({"path": rel, "status": st,
+                        "local": {"size": l[0], "mtime": l[1]} if l else None,
+                        "remote": {"size": r[0], "mtime": r[1]} if r else None})
+    entries.sort(key=lambda e: e["status"] == "same")     # Differences First (Stable)
+    return {"local_dir": str(local_path(scan.local_dir)), "remote_dir": norm_dir(scan.remote_dir),
+            "remote_exists": scan.remote_exists, "counts": counts, "truncated": len(entries) > COMPARE_CAP,
+            "entries": entries[:COMPARE_CAP]}
+
+
+# ----------------------------------------------------------------------- Handlers
+def list_remote(path):
+    out = rc.run(["lsjson", rc.spec(path), "--no-mimetype"])
+    entries = [{"name": e["Name"], "is_dir": bool(e["IsDir"]),
+                "size": -1 if e["IsDir"] else e["Size"], "modified": e.get("ModTime", "")}
+               for e in json.loads(out or "[]")]
+    return {"path": "/" + "/".join(p for p in path.split("/") if p), "entries": entries}
+
+
+def list_local(path, hidden):
+    p = local_path(path)
+    if not p.is_dir():
+        raise ApiError(400, f"Not a directory: {p}")
+    entries = []
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                if not hidden and e.name.startswith("."):
+                    continue
+                try:
+                    st = e.stat()
+                    is_dir = e.is_dir()
+                except OSError:
+                    continue
+                entries.append({"name": e.name, "is_dir": is_dir,
+                                "size": -1 if is_dir else st.st_size,
+                                "modified": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                                          time.localtime(st.st_mtime))})
+    except PermissionError:
+        raise ApiError(403, f"Permission denied: {p}")
+    try:
+        free = shutil.disk_usage(p).free
+    except OSError:
+        free = None
+    at_top = p == p.parent or (LOCAL_ROOT is not None and Path(os.path.realpath(p)) == LOCAL_ROOT)
+    return {"path": str(p), "parent": None if at_top else str(p.parent),
+            "entries": entries, "free": free, "writable": os.access(p, os.W_OK)}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "pdrive-web"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_):
+        pass
+
+    # -- Plumbing
+    def reply(self, status, body, ctype="application/json", headers=()):
+        if not isinstance(body, bytes):
+            body = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def cookie_ok(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, val = part.strip().partition("=")
+            if name == self.server.cookie_name and hmac.compare_digest(val, self.server.key):
+                return True
+        return False
+
+    def host_ok(self):
+        return self.headers.get("Host", "") in self.server.allowed_hosts
+
+    def origin_ok(self):
+        origin = self.headers.get("Origin")
+        return origin is None or origin in {f"http://{h}" for h in self.server.allowed_hosts}
+
+    def read_body(self):
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            raise ApiError(415, "JSON required.")
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY:
+            raise ApiError(413, "Body too large.")
+        try:
+            data = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            raise ApiError(400, "Invalid JSON.")
+        if not isinstance(data, dict):
+            raise ApiError(400, "Invalid JSON.")
+        return data
+
+    # -- Dispatch
+    def do_GET(self):
+        self.dispatch("GET")
+
+    def do_POST(self):
+        self.dispatch("POST")
+
+    def dispatch(self, method):
+        try:
+            if not self.host_ok() or not self.origin_ok():
+                raise ApiError(403, "Forbidden.")
+            url = urlparse(self.path)
+            query = parse_qs(url.query)
+
+            if method == "GET" and url.path == "/":
+                key = (query.get("k") or [""])[0]
+                if key and hmac.compare_digest(key, self.server.key):
+                    cookie = (f"{self.server.cookie_name}={self.server.key}; "
+                              "HttpOnly; SameSite=Strict; Path=/")
+                    return self.reply(302, b"", "text/plain",
+                                      [("Location", "/"), ("Set-Cookie", cookie)])
+                if not self.cookie_ok():
+                    raise ApiError(403, "Open the link printed in the terminal where "
+                                        "pdrive-web was started.")
+                return self.reply(200, (WEB_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
+
+            if method == "GET" and url.path in STATIC:
+                f = WEB_DIR / STATIC[url.path]
+                ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+                return self.reply(200, f.read_bytes(), ctype)
+
+            if url.path.startswith("/api/"):
+                if not self.cookie_ok():
+                    raise ApiError(401, "Session expired. Open the link from the terminal again.")
+                body = self.read_body() if method == "POST" else {}
+                return self.reply(200, self.api(method, url.path[5:], query, body))
+
+            raise ApiError(404, "Not found.")
+        except ApiError as e:
+            self.reply(e.status, {"error": e.message})
+        except Exception as e:      # Never Leave The Browser Hanging
+            self.reply(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def api(self, method, route, q, body):
+        arg = lambda k, d="": (q.get(k) or [d])[0]
+
+        if method == "GET":
+            if route == "status":
+                chosen = sync_dir()
+                return {"rclone": rc.version, "remote": rc.remote,
+                        "home": str(LOCAL_ROOT or Path.home()), "local_root": bool(LOCAL_ROOT),
+                        "local_label": os.environ.get("PDRIVE_LOCAL_LABEL", ""),
+                        "default_local": chosen or LOCAL_DEFAULT, "sync_dir": chosen,
+                        "busy": rc.lock.locked(), "logged_in": rc.logged_in(),
+                        "account": rc.account()}
+            if route == "ls":
+                require_login()
+                return list_remote(arg("path", "/"))
+            if route == "local":
+                return list_local(arg("path") or str(LOCAL_ROOT or Path.home()), arg("hidden") == "1")
+            m = re.fullmatch(r"compare/([0-9a-f]+)", route)
+            if m:
+                scan = SCANS.get(m.group(1))
+                if not scan:
+                    raise ApiError(404, "Unknown comparison.")
+                return scan.snapshot(arg("ignore_time") == "1")
+            if route == "size":
+                require_login()
+                out = rc.run(["size", "--json", rc.spec(arg("path", "/"))])
+                return json.loads(out)
+            if route == "jobs":
+                with JOBS_MU:
+                    jobs = sorted(JOBS.values(), key=lambda j: -j.created)
+                return {"jobs": [j.snapshot(tail=0) for j in jobs]}
+            m = re.fullmatch(r"jobs/([0-9a-f]+)", route)
+            if m:
+                job = JOBS.get(m.group(1))
+                if not job:
+                    raise ApiError(404, "Unknown job.")
+                return job.snapshot()
+        else:
+            if route == "mkdir":
+                require_login()
+                name = clean_name(body.get("name"))
+                rc.run(["mkdir", rc.spec(f"{body.get('path', '/')}/{name}")])
+                invalidate_remote()
+                return {"ok": True}
+            if route == "login":
+                invalidate_remote()
+                rc.login(str(body.get("username", "")).strip(), str(body.get("password", "")),
+                         str(body.get("mailbox_password", "")), str(body.get("code", "")).strip())
+                return {"ok": True}
+            if route == "logout":
+                rc.logout()
+                invalidate_remote()
+                return {"ok": True}
+            if route == "settings":
+                p = local_path(body.get("sync_dir"), must_exist=False)
+                if body.get("create"):
+                    p.mkdir(parents=True, exist_ok=True)
+                if not p.is_dir():
+                    raise ApiError(400, f"Not a folder: {p}")
+                save_settings({**load_settings(), "sync_dir": str(p)})
+                return {"ok": True, "sync_dir": str(p)}
+            if route == "local_mkdir":
+                parent = local_path(body.get("path"))
+                made = local_path(str(parent / clean_name(body.get("name"))), must_exist=False)
+                made.mkdir(exist_ok=True)
+                return {"ok": True, "path": str(made)}
+            if route == "compare/start":
+                require_login()
+                scan = start_scan(str(body.get("local", "")), str(body.get("remote", "/")) or "/",
+                                  bool(body.get("refresh")))
+                return scan.snapshot()
+            m = re.fullmatch(r"compare/([0-9a-f]+)/cancel", route)
+            if m:
+                scan = SCANS.get(m.group(1))
+                if scan:
+                    scan.cancel()
+                return {"ok": True}
+            if route == "jobs":
+                require_login()
+                return start_job(build_job(body)).snapshot()
+            m = re.fullmatch(r"jobs/([0-9a-f]+)/cancel", route)
+            if m:
+                job = JOBS.get(m.group(1))
+                if not job:
+                    raise ApiError(404, "Unknown job.")
+                job.cancel()
+                return {"ok": True}
+            if route == "quit":
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return {"ok": True}
+        raise ApiError(404, "Unknown endpoint.")
+
+
+# --------------------------------------------------------------------------- Main
+def main():
+    ap = argparse.ArgumentParser(description="Local web UI for Proton Drive (rclone).")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--no-browser", action="store_true", help="only print the link")
+    ap.add_argument("--host", default=BIND_HOST,
+                    help="address to bind (default 127.0.0.1; 0.0.0.0 only inside a container)")
+    args = ap.parse_args()
+
+    if not rc.locate():
+        sys.exit("No rclone with Proton Drive support found. Run ./install.sh first.")
+    rc.pick_remote()
+
+    server = None
+    for port in range(args.port, args.port + 20):
+        try:
+            server = ThreadingHTTPServer((args.host, port), Handler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        sys.exit(f"No free port in {args.port}-{args.port + 19}.")
+    server.daemon_threads = True
+    server.key = FIXED_KEY or secrets.token_urlsafe(32)
+    shown = int(PUBLIC_PORT) if PUBLIC_PORT.isdigit() else port
+    server.cookie_name = f"pdrive_{shown}"
+    server.allowed_hosts = {f"127.0.0.1:{shown}", f"localhost:{shown}"}
+
+    url = f"http://127.0.0.1:{shown}/?k={server.key}"
+    print(f"pdrive-web  {rc.version}  remote '{rc.remote}:'", flush=True)
+    print(f"Open: {url}", flush=True)
+    print("Ctrl+C to stop.", flush=True)
+    if not args.no_browser:
+        threading.Timer(0.4, webbrowser.open, (url,)).start()
+
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with JOBS_MU:
+            for j in JOBS.values():
+                if j.state == "running":
+                    j.cancel()
+        server.server_close()
+        print("Bye.")
+
+
+if __name__ == "__main__":
+    main()

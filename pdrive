@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+# pdrive - interactive browser for Proton Drive, built on rclone.
+#
+# Connects to Proton Drive, shows what is there, and lets you download or upload
+# choosing both what and where, with a selectable conflict policy.
+#
+# Dependencies: bash 4+, curl, unzip (the latter two only to install rclone).
+
+set -uo pipefail
+
+# ----------------------------------------------------------------- configuration
+RCLONE_BIN="${PDRIVE_RCLONE:-$HOME/.local/bin/rclone}"
+REMOTE="${PDRIVE_REMOTE:-}"          # empty: detected or asked for
+LOCAL_DEFAULT="${PDRIVE_LOCAL:-$HOME/ProtonDrive}"
+MIN_RCLONE_MINOR=64                  # the protondrive backend landed in rclone 1.64
+SEP=$'\x1f'                          # field separator unlikely to appear in names
+
+# Common flags. Proton Drive needs replace-existing-draft to overwrite a file of
+# the same name without leaving orphaned drafts behind.
+RCLONE_FLAGS=(
+  --protondrive-replace-existing-draft=true
+  --transfers 4
+  --checkers 8
+  --retries 3
+  --low-level-retries 10
+)
+
+# ------------------------------------------------------------------------ styling
+if [[ -t 1 ]]; then
+  B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'
+  CY=$'\e[36m'; GR=$'\e[32m'; YL=$'\e[33m'; RD=$'\e[31m'
+else
+  B=''; D=''; R=''; CY=''; GR=''; YL=''; RD=''
+fi
+
+info()  { printf '%s\n' "${CY}==>${R} $*"; }
+ok()    { printf '%s\n' "${GR}✓${R} $*"; }
+warn()  { printf '%s\n' "${YL}!${R} $*" >&2; }
+die()   { printf '%s\n' "${RD}✗${R} $*" >&2; exit 1; }
+
+human() { # bytes -> readable, no dependency beyond awk
+  awk -v b="${1:-0}" 'BEGIN{
+    if (b < 0) { printf "—"; exit }
+    split("B KiB MiB GiB TiB", u, " ")
+    i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]
+  }'
+}
+
+pause() { read -rsn1 -p "${D}[press enter to continue]${R}" _ 2>/dev/null; echo; }
+
+# -------------------------------------------------------------------- rclone setup
+ensure_rclone() {
+  local candidate found=""
+  for candidate in "$RCLONE_BIN" "$(command -v rclone 2>/dev/null)"; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    if "$candidate" help backends 2>/dev/null | grep -qi protondrive; then
+      found="$candidate"; break
+    fi
+  done
+
+  if [[ -n "$found" ]]; then
+    RCLONE_BIN="$found"
+    return 0
+  fi
+
+  warn "No rclone with Proton Drive support found."
+  local sysver
+  sysver=$(command -v rclone >/dev/null && rclone version 2>/dev/null | head -1 || echo "none")
+  printf '    system rclone: %s (need >= 1.%s)\n' "$sysver" "$MIN_RCLONE_MINOR"
+  read -rp "Download the official binary to ${RCLONE_BIN}? [Y/n] " a
+  [[ "${a,,}" == n* ]] && die "rclone >= 1.$MIN_RCLONE_MINOR with the protondrive backend is required."
+
+  command -v curl  >/dev/null || die "curl is not available."
+  command -v unzip >/dev/null || die "unzip is not available."
+
+  local arch tmp
+  case "$(uname -m)" in
+    x86_64)  arch=amd64 ;;
+    aarch64) arch=arm64 ;;
+    armv7l)  arch=arm-v7 ;;
+    *) die "Unsupported architecture: $(uname -m)" ;;
+  esac
+
+  tmp=$(mktemp -d) || die "mktemp failed"
+  trap 'rm -rf "$tmp"' RETURN
+
+  info "Downloading rclone-current-linux-${arch}..."
+  curl -fL --progress-bar -o "$tmp/rclone.zip" \
+    "https://downloads.rclone.org/rclone-current-linux-${arch}.zip" \
+    || die "Download failed."
+  unzip -q -o "$tmp/rclone.zip" -d "$tmp" || die "Extraction failed."
+
+  local bin
+  bin=$(find "$tmp" -type f -name rclone -perm -u+x | head -1)
+  [[ -n "$bin" ]] || die "No rclone binary inside the archive."
+
+  mkdir -p "$(dirname "$RCLONE_BIN")"
+  install -m 755 "$bin" "$RCLONE_BIN" || die "Could not install to $RCLONE_BIN."
+  ok "Installed: $("$RCLONE_BIN" version | head -1)"
+
+  "$RCLONE_BIN" help backends 2>/dev/null | grep -qi protondrive \
+    || die "This rclone build has no protondrive backend."
+}
+
+rc() { "$RCLONE_BIN" "$@"; }
+
+ensure_remote() {
+  [[ -n "$REMOTE" ]] && return 0
+
+  local -a candidates=()
+  local name type
+  while IFS= read -r name; do
+    name=${name%:}
+    [[ -n "$name" ]] || continue
+    type=$(rc config show "$name" 2>/dev/null | grep -m1 '^type[[:space:]]*=' | sed 's/.*=[[:space:]]*//')
+    [[ "$type" == "protondrive" ]] && candidates+=("$name")
+  done < <(rc listremotes 2>/dev/null)
+
+  if (( ${#candidates[@]} == 1 )); then
+    REMOTE="${candidates[0]}"
+    return 0
+  fi
+
+  if (( ${#candidates[@]} > 1 )); then
+    echo "Configured Proton Drive remotes:"
+    local i
+    for i in "${!candidates[@]}"; do printf '  [%d] %s\n' "$((i+1))" "${candidates[i]}"; done
+    read -rp "Which one? [1] " a
+    a=${a:-1}
+    REMOTE="${candidates[$((a-1))]:-${candidates[0]}}"
+    return 0
+  fi
+
+  warn "No remote of type protondrive is configured."
+  cat <<'EOF'
+
+About to open the rclone configuration wizard. In it:
+  n)  new remote
+  name:  proton
+  storage: search for "protondrive" and enter the matching number
+  username: your Proton email address
+  password: use an APP-SPECIFIC PASSWORD if you have 2FA enabled
+            (account.proton.me -> Account -> Password and recovery)
+  2FA: enter the code if prompted
+  Answer "n" to advanced config, then "y" to save and "q" to quit.
+
+EOF
+  pause
+  rc config || true
+
+  while IFS= read -r name; do
+    name=${name%:}
+    [[ -n "$name" ]] || continue
+    type=$(rc config show "$name" 2>/dev/null | grep -m1 '^type[[:space:]]*=' | sed 's/.*=[[:space:]]*//')
+    [[ "$type" == "protondrive" ]] && { REMOTE="$name"; break; }
+  done < <(rc listremotes 2>/dev/null)
+
+  [[ -n "$REMOTE" ]] || die "Configuration was not completed."
+
+  local conf
+  conf=$(rc config file 2>/dev/null | tail -1)
+  [[ -f "$conf" ]] && chmod 600 "$conf" 2>/dev/null
+  ok "Remote '$REMOTE' is ready."
+}
+
+# --------------------------------------------------------------------- navigation
+CWD=""                 # current remote path, without a leading slash
+declare -a N_NAME N_TYPE N_SIZE N_MOD
+
+remote_path() { # rclone path of the current directory
+  if [[ -z "$CWD" ]]; then printf '%s:' "$REMOTE"; else printf '%s:%s' "$REMOTE" "$CWD"; fi
+}
+
+load_listing() {
+  N_NAME=(); N_TYPE=(); N_SIZE=(); N_MOD=()
+  local target line name size mod
+  target=$(remote_path)
+
+  info "Reading ${B}$target${R} ..."
+
+  local errfile raw rcstatus
+  errfile=$(mktemp) || return 1
+  raw=$(rc lsf "$target" --dirs-only "${RCLONE_FLAGS[@]}" 2>"$errfile")
+  rcstatus=$?
+  if (( rcstatus != 0 )); then
+    warn "Could not read $target:"
+    sed 's/^/    /' "$errfile" >&2
+    rm -f "$errfile"
+    return 1
+  fi
+  rm -f "$errfile"
+
+  local -a dirs=()
+  [[ -n "$raw" ]] && mapfile -t dirs <<<"$raw"
+  for line in "${dirs[@]}"; do
+    [[ -n "$line" ]] || continue
+    N_NAME+=("${line%/}"); N_TYPE+=(dir); N_SIZE+=(-1); N_MOD+=("")
+  done
+
+  local -a files=()
+  local listing
+  errfile=$(mktemp) || return 1
+  listing=$(rc lsf "$target" --files-only --format pst --separator "$SEP" \
+              "${RCLONE_FLAGS[@]}" 2>"$errfile")
+  rcstatus=$?
+  [[ -n "$listing" ]] && mapfile -t files <<<"$listing"
+  if (( rcstatus != 0 )); then
+    warn "The file list of $target may be incomplete:"
+    sed 's/^/    /' "$errfile" >&2
+  fi
+  rm -f "$errfile"
+  for line in "${files[@]}"; do
+    [[ -n "$line" ]] || continue
+    name=${line%%"$SEP"*}
+    local rest=${line#*"$SEP"}
+    size=${rest%%"$SEP"*}
+    mod=${rest#*"$SEP"}
+    mod=${mod:0:16}; mod=${mod/T/ }
+    N_NAME+=("$name"); N_TYPE+=(file); N_SIZE+=("${size:-0}"); N_MOD+=("$mod")
+  done
+  return 0
+}
+
+show_listing() {
+  local i icon size
+  echo
+  printf '%s\n' "${B}📂 ${REMOTE}:/${CWD}${R}"
+  if (( ${#N_NAME[@]} == 0 )); then
+    printf '   %s\n' "${D}(empty)${R}"
+  fi
+  for i in "${!N_NAME[@]}"; do
+    if [[ "${N_TYPE[i]}" == dir ]]; then
+      icon="📁"; size="${D}—${R}"
+    else
+      icon="📄"; size=$(human "${N_SIZE[i]}")
+    fi
+    printf '  %s[%2d]%s %s %-44s %10s  %s%s%s\n' \
+      "$YL" "$((i+1))" "$R" "$icon" "${N_NAME[i]}" "$size" "$D" "${N_MOD[i]}" "$R"
+  done
+  echo
+}
+
+show_help() {
+  cat <<EOF
+${B}Commands${R}
+  ${YL}<n>${R}        enter directory n
+  ${YL}d${R}          download (pick items and a local destination)
+  ${YL}u${R}          upload (pick local files/directories and a remote destination)
+  ${YL}..${R} / ${YL}s${R}    parent directory            ${YL}/${R}  back to root
+  ${YL}cd${R}         go to a remote path                ${YL}l${R}  reload listing
+  ${YL}mkdir${R}      create a remote directory          ${YL}i${R}  size of an item
+  ${YL}rm${R}         delete on the remote (asks for confirmation)
+  ${YL}?${R}          this help                          ${YL}q${R}  quit
+EOF
+}
+
+# ------------------------------------------------------------------ item selection
+# Parses "1 3 5-7" and fills SELECTED with 0-based indices.
+declare -a SELECTED
+parse_selection() {
+  SELECTED=()
+  local input="$1" max="$2" token a b n
+  for token in ${input//,/ }; do
+    if [[ "$token" == "*" ]]; then
+      for ((n=0; n<max; n++)); do SELECTED+=("$n"); done
+      continue
+    fi
+    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+      (( a <= b )) || { n=$a; a=$b; b=$n; }
+      for ((n=a; n<=b; n++)); do
+        (( n >= 1 && n <= max )) && SELECTED+=("$((n-1))")
+      done
+    elif [[ "$token" =~ ^[0-9]+$ ]]; then
+      (( token >= 1 && token <= max )) && SELECTED+=("$((token-1))")
+    else
+      warn "Ignoring '$token'."
+    fi
+  done
+  (( ${#SELECTED[@]} > 0 ))
+}
+
+# Conflict policy -> fills CONFLICT_FLAGS and CONFLICT_DESC
+declare -a CONFLICT_FLAGS
+CONFLICT_DESC=""
+ask_conflict() {
+  cat <<EOF
+
+${B}If the file already exists at the destination:${R}
+  [1] overwrite if different            ${D}(default behaviour)${R}
+  [2] skip files already there          ${D}(--ignore-existing)${R}
+  [3] overwrite only if newer           ${D}(--update)${R}
+  [4] keep both                         ${D}(rename the old one with a suffix)${R}
+EOF
+  read -rp "Choice [1]: " a
+  case "${a:-1}" in
+    2) CONFLICT_FLAGS=(--ignore-existing); CONFLICT_DESC="skip existing" ;;
+    3) CONFLICT_FLAGS=(--update);          CONFLICT_DESC="only if newer" ;;
+    4) CONFLICT_FLAGS=(--suffix ".old-$(date +%Y%m%d-%H%M%S)" --suffix-keep-extension)
+       CONFLICT_DESC="keep both" ;;
+    *) CONFLICT_FLAGS=();                  CONFLICT_DESC="overwrite if different" ;;
+  esac
+}
+
+# Runs a transfer: dry-run first, then confirmation.
+# $1 = description  $2.. = rclone arguments (after the subcommand)
+run_transfer() {
+  local desc="$1"; shift
+  local -a args=("$@")
+
+  echo
+  info "Preview (${B}no changes made${R}): $desc"
+  rc "${args[@]}" "${RCLONE_FLAGS[@]}" "${CONFLICT_FLAGS[@]}" --dry-run --stats-one-line -v 2>&1 \
+    | sed 's/^/    /' | head -60
+
+  echo
+  read -rp "${B}Proceed?${R} [y/N] " a
+  if [[ "${a,,}" != y* ]]; then
+    warn "Cancelled."
+    return 1
+  fi
+
+  echo
+  info "Transferring..."
+  local code=0
+  rc "${args[@]}" "${RCLONE_FLAGS[@]}" "${CONFLICT_FLAGS[@]}" --progress --stats 1s || code=$?
+  if (( code == 0 )); then
+    ok "Done: $desc"
+  else
+    warn "rclone exited with errors (code $code)."
+    return 1
+  fi
+}
+
+# ----------------------------------------------------------------------- download
+do_download() {
+  (( ${#N_NAME[@]} )) || { warn "Nothing to download in this directory."; return; }
+
+  echo
+  read -rp "What should I download? (e.g. ${YL}1 3 5-7${R}, ${YL}*${R} for everything): " sel
+  parse_selection "$sel" "${#N_NAME[@]}" || { warn "No valid selection."; return; }
+
+  echo
+  echo "${B}Selected:${R}"
+  local i
+  for i in "${SELECTED[@]}"; do
+    printf '  %s %s\n' "$([[ ${N_TYPE[i]} == dir ]] && echo 📁 || echo 📄)" "${N_NAME[i]}"
+  done
+
+  echo
+  local dest
+  read -rep "Local destination: " -i "$LOCAL_DEFAULT" dest
+  dest="${dest/#\~/$HOME}"
+  [[ -n "$dest" ]] || { warn "Empty destination."; return; }
+
+  if [[ ! -d "$dest" ]]; then
+    read -rp "'$dest' does not exist. Create it? [Y/n] " a
+    [[ "${a,,}" == n* ]] && { warn "Cancelled."; return; }
+    mkdir -p "$dest" || { warn "Could not create '$dest'."; return; }
+  fi
+
+  # Free space: warn when it is tight
+  local avail
+  avail=$(df -P "$dest" 2>/dev/null | awk 'NR==2{print $4}')
+  if [[ -n "$avail" ]] && (( avail < 2097152 )); then
+    warn "Only $(human $((avail*1024))) free on $dest."
+    read -rp "Continue anyway? [y/N] " a
+    [[ "${a,,}" == y* ]] || return
+  fi
+
+  ask_conflict
+
+  local base name src
+  base=$(remote_path)
+  for i in "${SELECTED[@]}"; do
+    name="${N_NAME[i]}"
+    src="${base%/}/$name"
+    [[ "$base" == *: ]] && src="${base}${name}"
+
+    if [[ "${N_TYPE[i]}" == dir ]]; then
+      run_transfer "📁 $name → $dest/$name  [$CONFLICT_DESC]" \
+        copy "$src" "$dest/$name" --create-empty-src-dirs
+    else
+      run_transfer "📄 $name → $dest/  [$CONFLICT_DESC]" \
+        copy "$src" "$dest"
+    fi
+  done
+}
+
+# ------------------------------------------------------------------------- upload
+do_upload() {
+  echo
+  echo "${D}One path per line. Empty line to finish. Tab completes, globs work.${R}"
+  local -a sources=()
+  local line expanded p
+  while true; do
+    read -rep "  local> " line || break
+    [[ -z "$line" ]] && break
+    line="${line/#\~/$HOME}"
+    line="${line%\"}"; line="${line#\"}"     # Optional Surrounding Quotes
+    # Expand Globs Without Evaluating The Line As Shell Code
+    if [[ "$line" == *[*?[]* ]]; then
+      [[ "$line" == -* ]] && line="./$line"
+      expanded=$(compgen -G "$line" || true)
+    else
+      expanded=$line
+    fi
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      if [[ -e "$p" ]]; then
+        sources+=("$p")
+        printf '    %s %s\n' "$GR✓$R" "$p"
+      else
+        warn "  does not exist: $p"
+      fi
+    done <<<"$expanded"
+  done
+
+  (( ${#sources[@]} )) || { warn "No valid path given."; return; }
+
+  echo
+  local destdir
+  read -rep "Remote destination directory: " -i "/$CWD" destdir
+  destdir="${destdir#/}"
+  destdir="${destdir%/}"
+
+  local target
+  if [[ -z "$destdir" ]]; then target="$REMOTE:"; else target="$REMOTE:$destdir"; fi
+
+  ask_conflict
+
+  local s name
+  for s in "${sources[@]}"; do
+    name=$(basename "$s")
+    if [[ -d "$s" ]]; then
+      run_transfer "📁 $s → ${target%/}/$name  [$CONFLICT_DESC]" \
+        copy "$s" "${target%/}/$name" --create-empty-src-dirs
+    else
+      run_transfer "📄 $s → $target  [$CONFLICT_DESC]" \
+        copy "$s" "$target"
+    fi
+  done
+}
+
+# -------------------------------------------------------------- remote operations
+do_mkdir() {
+  read -rp "Name of the new directory: " name
+  [[ -n "$name" ]] || return
+  local base target
+  base=$(remote_path)
+  target="${base%/}/$name"
+  [[ "$base" == *: ]] && target="${base}${name}"
+  if rc mkdir "$target" "${RCLONE_FLAGS[@]}"; then ok "Created: $name"; else warn "Could not create it."; fi
+}
+
+do_remove() {
+  (( ${#N_NAME[@]} )) || return
+  echo
+  read -rp "${RD}What should I delete on the remote?${R} (numbers): " sel
+  parse_selection "$sel" "${#N_NAME[@]}" || { warn "No selection."; return; }
+
+  echo
+  echo "${RD}${B}These will be deleted from Proton Drive:${R}"
+  local i
+  for i in "${SELECTED[@]}"; do printf '  %s\n' "${N_NAME[i]}"; done
+  echo
+  read -rp "Type ${B}DELETE${R} to confirm: " a
+  [[ "$a" == "DELETE" ]] || { warn "Cancelled."; return; }
+
+  local base target
+  base=$(remote_path)
+  for i in "${SELECTED[@]}"; do
+    target="${base%/}/${N_NAME[i]}"
+    [[ "$base" == *: ]] && target="${base}${N_NAME[i]}"
+    if [[ "${N_TYPE[i]}" == dir ]]; then
+      rc purge "$target" "${RCLONE_FLAGS[@]}" && ok "Deleted directory ${N_NAME[i]}"
+    else
+      rc deletefile "$target" "${RCLONE_FLAGS[@]}" && ok "Deleted ${N_NAME[i]}"
+    fi
+  done
+}
+
+do_info() {
+  read -rp "Item number: " n
+  [[ "$n" =~ ^[0-9]+$ ]] || return
+  (( n >= 1 && n <= ${#N_NAME[@]} )) || return
+  local i=$((n-1)) base target
+  base=$(remote_path)
+  target="${base%/}/${N_NAME[i]}"
+  [[ "$base" == *: ]] && target="${base}${N_NAME[i]}"
+  info "Computing size of ${N_NAME[i]}..."
+  rc size "$target" "${RCLONE_FLAGS[@]}" 2>&1 | sed 's/^/    /'
+  pause
+}
+
+# --------------------------------------------------------------------------- main
+main() {
+  printf '\n%s\n' "${B}${CY}Proton Drive — interactive browser${R}"
+  ensure_rclone
+  ensure_remote
+  ok "Connected to ${B}${REMOTE}:${R} using $("$RCLONE_BIN" version | head -1)"
+
+  load_listing || die "Could not read the remote. Check your credentials with: $RCLONE_BIN config"
+
+  local cmd
+  while true; do
+    show_listing
+    read -rp "${B}pdrive${R} ${D}(? for help)${R} > " cmd || break
+    case "$cmd" in
+      '')            ;;
+      [0-9]*)
+        if [[ ! "$cmd" =~ ^[0-9]+$ ]]; then
+          warn "Invalid index: '$cmd'"
+        elif (( cmd >= 1 && cmd <= ${#N_NAME[@]} )); then
+          local i=$((cmd-1))
+          if [[ "${N_TYPE[i]}" == dir ]]; then
+            CWD="${CWD:+$CWD/}${N_NAME[i]}"
+            load_listing || { CWD="${CWD%/*}"; }
+          else
+            warn "'${N_NAME[i]}' is a file. Use 'd' to download it."
+          fi
+        else
+          warn "Index out of range."
+        fi
+        ;;
+      d|D)           do_download ;;
+      u|U)           do_upload ;;
+      ..|s|S)
+        if [[ -n "$CWD" ]]; then
+          [[ "$CWD" == */* ]] && CWD="${CWD%/*}" || CWD=""
+          load_listing
+        else
+          warn "Already at the root."
+        fi
+        ;;
+      /|r|R)         CWD=""; load_listing ;;
+      cd)
+        read -rep "Remote path: " -i "/$CWD" p
+        p="${p#/}"; p="${p%/}"
+        local prev="$CWD"; CWD="$p"
+        load_listing || { CWD="$prev"; load_listing; }
+        ;;
+      l|L)           load_listing ;;
+      mkdir)         do_mkdir; load_listing ;;
+      rm)            do_remove; load_listing ;;
+      i|I)           do_info ;;
+      \?|h|help)     show_help; pause ;;
+      q|Q|exit)      echo "Bye."; break ;;
+      *)             warn "Unknown command: '$cmd' (? for help)" ;;
+    esac
+  done
+}
+
+main "$@"

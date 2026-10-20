@@ -1,0 +1,11 @@
+.env
+*.tar.gz
+rclone.conf
+__pycache__
+.git
+.env
+*.tar.gz
+rclone.conf
+__pycache__
+.git
+tests

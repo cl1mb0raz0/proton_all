@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# pdrive-selftest - Checks How Proton Drive Really Behaves, With A Throwaway Folder.
+#
+# Verifies What Proton All Relies On: A Saved Session, Original Modification Times
+# After Upload And Download, The "Keep Both" Suffix And The Speed Of A Recursive
+# Listing. Everything Is Created Under proton-all-selftest-<time> And Deleted At The End.
+# Usage:  docker compose exec pdrive pdrive-selftest
+set -uo pipefail
+
+RCLONE="${PDRIVE_RCLONE:-$(command -v rclone || echo "$HOME/.local/bin/rclone")}"
+REMOTE="${PDRIVE_REMOTE:-proton}"
+FLAGS=(--protondrive-replace-existing-draft=true --retries 3 --low-level-retries 10)
+STAMP=$(date +%Y%m%d-%H%M%S)
+BASE="$REMOTE:proton-all-selftest-$STAMP"
+WORK=$(mktemp -d)
+fails=0
+
+pass() { printf '  PASS  %s\n' "$1"; }
+fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
+note() { printf '        %s\n' "$1"; }
+cleanup() { "$RCLONE" purge "$BASE" "${FLAGS[@]}" >/dev/null 2>&1; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+echo "Remote: $REMOTE:   Test Folder: $BASE"
+
+echo "1. Session"
+if "$RCLONE" lsd "$REMOTE:" --max-depth 1 "${FLAGS[@]}" >/dev/null 2>"$WORK/err"; then
+  pass "Logged in (to Test Persistence, Restart The Container And Run This Again)"
+else
+  fail "Not logged in: $(tail -1 "$WORK/err")"
+  echo "Log In In The Browser First (In In The Sidebar)."; exit 1
+fi
+
+echo "2. Modification Time After Upload"
+mkdir -p "$WORK/up" "$WORK/down"
+printf 'first version\n' > "$WORK/up/a.txt"
+touch -d @1577934245 "$WORK/up/a.txt"                      # 2020-01-02 03:04:05 UTC
+"$RCLONE" copy "$WORK/up" "$BASE/dir" "${FLAGS[@]}" 2>"$WORK/err" || { fail "Upload: $(tail -1 "$WORK/err")"; exit 1; }
+mod=$("$RCLONE" lsjson "$BASE/dir" --no-mimetype "${FLAGS[@]}" 2>/dev/null \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["ModTime"])')
+epoch=$(date -d "$mod" +%s 2>/dev/null || echo 0)
+note "Remote Time: $mod   (Local Was 2020-01-02T03:04:05Z)"
+if (( epoch >= 1577934243 && epoch <= 1577934247 )); then
+  pass "Proton Keeps The Original Modification Time"
+else
+  fail "Proton Does Not Keep It: Use \"Ignore Time When Sizes Match\" In Compare"
+fi
+
+echo "3. Download Round Trip"
+"$RCLONE" copy "$BASE/dir" "$WORK/down" "${FLAGS[@]}" 2>"$WORK/err" || fail "Download: $(tail -1 "$WORK/err")"
+cmp -s "$WORK/up/a.txt" "$WORK/down/a.txt" && pass "Content Is Identical" || fail "Content Differs"
+back=$(stat -c %Y "$WORK/down/a.txt" 2>/dev/null || echo 0)
+(( back >= 1577934243 && back <= 1577934247 )) && pass "Downloaded File Has The Original Time" \
+  || fail "Downloaded File Time Is $back"
+
+echo "4. Keep Both (--suffix)"
+printf 'second version, longer\n' > "$WORK/up/a.txt"
+"$RCLONE" copy "$WORK/up" "$BASE/dir" --suffix .old-TEST --suffix-keep-extension "${FLAGS[@]}" 2>"$WORK/err" \
+  || fail "Copy With Suffix: $(tail -1 "$WORK/err")"
+names=$("$RCLONE" lsf "$BASE/dir" "${FLAGS[@]}" 2>/dev/null | sort | tr '\n' ' ')
+note "Remote Now Has: $names"
+if [[ "$names" == *"a.old-TEST.txt"* && "$names" == *"a.txt"* ]]; then
+  pass "The Old Version Was Kept As a.old-TEST.txt"
+else
+  fail "No Backup Copy Was Made: Policy 4 (Keep Both) Does Not Work On This Backend"
+fi
+
+echo "5. Recursive Listing Speed"
+for i in 1 2 3 4 5; do printf 'x%s\n' "$i" > "$WORK/up/f$i.txt"; done
+"$RCLONE" copy "$WORK/up" "$BASE/dir" "${FLAGS[@]}" >/dev/null 2>&1
+t0=$(date +%s.%N)
+n=$("$RCLONE" lsjson -R --files-only --no-mimetype "$BASE" "${FLAGS[@]}" 2>/dev/null \
+    | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))')
+t1=$(date +%s.%N)
+secs=$(python3 -c "print(round($t1-$t0,1))")
+pass "$n Files Listed In ${secs}s (Compare Reads A Whole Folder The Same Way)"
+note "Multiply By Your Folder Size To Estimate A Large Compare."
+
+echo
+if (( fails == 0 )); then echo "All Checks Passed."; else echo "$fails Check(s) Failed: See Above."; fi
+exit $(( fails > 0 ))

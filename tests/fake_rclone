@@ -1,0 +1,30 @@
+#!/bin/bash
+# Fake Rclone For The Tests: Proton Login Is Faked (Code 123456 Works, 000429 Is Rate Limited),
+# Every Other Command Runs In The Real Rclone On A Local Folder Standing In For The Drive.
+# Env: FAKE_STATE (Folder For State), FAKE_DRIVE (The Drive), REAL_RCLONE.
+S=${FAKE_STATE:?}
+case "$1" in
+  help) echo "  protondrive  Proton Drive"; exit 0 ;;
+  version) echo "rclone v-fake"; exit 0 ;;
+  obscure) read -r p; echo "OBS-$p"; exit 0 ;;
+  config)
+    case "$2" in
+      delete) rm -f "$S/user" "$S/logged" ;;
+      create) for a in "$@"; do case $a in username=*) echo "${a#username=}" > "$S/user";; esac; done ;;
+      dump)
+        if [ -f "$S/logged" ]; then echo "{\"proton\":{\"type\":\"protondrive\",\"username\":\"$(cat "$S/user")\",\"client_refresh_token\":\"x\"}}"
+        elif [ -f "$S/user" ]; then echo "{\"proton\":{\"type\":\"protondrive\",\"username\":\"$(cat "$S/user")\"}}"
+        else echo '{}'; fi ;;
+    esac
+    exit 0 ;;
+esac
+if [ "$1" = lsd ] && [ -f "$S/user" ] && [ ! -f "$S/logged" ]; then
+  case "${RCLONE_CONFIG_PROTON_2FA:-}" in
+    123456) touch "$S/logged"; exit 0 ;;
+    000429) echo "429 too many requests" >&2; exit 1 ;;
+    *) echo "ERROR : 2FA code is invalid (Code=8002)" >&2; exit 1 ;;
+  esac
+fi
+[ "$1" = lsjson ] && { echo x >> "$S/lsjson.calls"; sleep "${LSDELAY:-0}"; }
+export RCLONE_CONFIG_PROTON_TYPE=alias RCLONE_CONFIG_PROTON_REMOTE="${FAKE_DRIVE:?}"
+exec "${REAL_RCLONE:?}" "$@"

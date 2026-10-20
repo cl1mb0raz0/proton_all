@@ -1,0 +1,5 @@
+.env
+*.tar.gz
+rclone.conf
+__pycache__/
+*.pyc
