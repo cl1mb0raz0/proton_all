@@ -7,7 +7,7 @@
 # Usage:  docker compose exec pdrive pdrive-selftest
 set -uo pipefail
 
-RCLONE="${PDRIVE_RCLONE:-$(command -v rclone || echo "$HOME/.local/bin/rclone")}"
+RCLONE="${PDRIVE_RCLONE:-rclone}"
 REMOTE="${PDRIVE_REMOTE:-proton}"
 FLAGS=(--protondrive-replace-existing-draft=true --retries 3 --low-level-retries 10)
 STAMP=$(date +%Y%m%d-%H%M%S)

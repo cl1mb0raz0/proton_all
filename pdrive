@@ -9,7 +9,7 @@
 set -uo pipefail
 
 # ----------------------------------------------------------------- configuration
-RCLONE_BIN="${PDRIVE_RCLONE:-$HOME/.local/bin/rclone}"
+RCLONE_BIN="${PDRIVE_RCLONE:-rclone}"
 REMOTE="${PDRIVE_REMOTE:-}"          # empty: detected or asked for
 LOCAL_DEFAULT="${PDRIVE_LOCAL:-$HOME/ProtonDrive}"
 MIN_RCLONE_MINOR=64                  # the protondrive backend landed in rclone 1.64
@@ -52,117 +52,23 @@ pause() { read -rsn1 -p "${D}[press enter to continue]${R}" _ 2>/dev/null; echo;
 
 # -------------------------------------------------------------------- rclone setup
 ensure_rclone() {
-  local candidate found=""
-  for candidate in "$RCLONE_BIN" "$(command -v rclone 2>/dev/null)"; do
-    [[ -n "$candidate" && -x "$candidate" ]] || continue
-    if "$candidate" help backends 2>/dev/null | grep -qi protondrive; then
-      found="$candidate"; break
-    fi
-  done
-
-  if [[ -n "$found" ]]; then
-    RCLONE_BIN="$found"
-    return 0
-  fi
-
-  warn "No rclone with Proton Drive support found."
-  local sysver
-  sysver=$(command -v rclone >/dev/null && rclone version 2>/dev/null | head -1 || echo "none")
-  printf '    system rclone: %s (need >= 1.%s)\n' "$sysver" "$MIN_RCLONE_MINOR"
-  read -rp "Download the official binary to ${RCLONE_BIN}? [Y/n] " a
-  [[ "${a,,}" == n* ]] && die "rclone >= 1.$MIN_RCLONE_MINOR with the protondrive backend is required."
-
-  command -v curl  >/dev/null || die "curl is not available."
-  command -v unzip >/dev/null || die "unzip is not available."
-
-  local arch tmp
-  case "$(uname -m)" in
-    x86_64)  arch=amd64 ;;
-    aarch64) arch=arm64 ;;
-    armv7l)  arch=arm-v7 ;;
-    *) die "Unsupported architecture: $(uname -m)" ;;
-  esac
-
-  tmp=$(mktemp -d) || die "mktemp failed"
-  trap 'rm -rf "$tmp"' RETURN
-
-  info "Downloading rclone-current-linux-${arch}..."
-  curl -fL --progress-bar -o "$tmp/rclone.zip" \
-    "https://downloads.rclone.org/rclone-current-linux-${arch}.zip" \
-    || die "Download failed."
-  unzip -q -o "$tmp/rclone.zip" -d "$tmp" || die "Extraction failed."
-
-  local bin
-  bin=$(find "$tmp" -type f -name rclone -perm -u+x | head -1)
-  [[ -n "$bin" ]] || die "No rclone binary inside the archive."
-
-  mkdir -p "$(dirname "$RCLONE_BIN")"
-  install -m 755 "$bin" "$RCLONE_BIN" || die "Could not install to $RCLONE_BIN."
-  ok "Installed: $("$RCLONE_BIN" version | head -1)"
-
   "$RCLONE_BIN" help backends 2>/dev/null | grep -qi protondrive \
-    || die "This rclone build has no protondrive backend."
+    || die "rclone with the protondrive backend (1.$MIN_RCLONE_MINOR or newer) was not found."
 }
 
 rc() { "$RCLONE_BIN" "$@"; }
 
+# The Proton Login Is Done In The Web Interface; Here The Saved Remote Is Only Found.
 ensure_remote() {
   [[ -n "$REMOTE" ]] && return 0
-
-  local -a candidates=()
   local name type
   while IFS= read -r name; do
     name=${name%:}
     [[ -n "$name" ]] || continue
     type=$(rc config show "$name" 2>/dev/null | grep -m1 '^type[[:space:]]*=' | sed 's/.*=[[:space:]]*//')
-    [[ "$type" == "protondrive" ]] && candidates+=("$name")
+    [[ "$type" == "protondrive" ]] && { REMOTE="$name"; return 0; }
   done < <(rc listremotes 2>/dev/null)
-
-  if (( ${#candidates[@]} == 1 )); then
-    REMOTE="${candidates[0]}"
-    return 0
-  fi
-
-  if (( ${#candidates[@]} > 1 )); then
-    echo "Configured Proton Drive remotes:"
-    local i
-    for i in "${!candidates[@]}"; do printf '  [%d] %s\n' "$((i+1))" "${candidates[i]}"; done
-    read -rp "Which one? [1] " a
-    a=${a:-1}
-    REMOTE="${candidates[$((a-1))]:-${candidates[0]}}"
-    return 0
-  fi
-
-  warn "No remote of type protondrive is configured."
-  cat <<'EOF'
-
-About to open the rclone configuration wizard. In it:
-  n)  new remote
-  name:  proton
-  storage: search for "protondrive" and enter the matching number
-  username: your Proton email address
-  password: use an APP-SPECIFIC PASSWORD if you have 2FA enabled
-            (account.proton.me -> Account -> Password and recovery)
-  2FA: enter the code if prompted
-  Answer "n" to advanced config, then "y" to save and "q" to quit.
-
-EOF
-  pause
-  rc config || true
-
-  while IFS= read -r name; do
-    name=${name%:}
-    [[ -n "$name" ]] || continue
-    type=$(rc config show "$name" 2>/dev/null | grep -m1 '^type[[:space:]]*=' | sed 's/.*=[[:space:]]*//')
-    [[ "$type" == "protondrive" ]] && { REMOTE="$name"; break; }
-  done < <(rc listremotes 2>/dev/null)
-
-  [[ -n "$REMOTE" ]] || die "Configuration was not completed."
-
-  local conf
-  conf=$(rc config file 2>/dev/null | tail -1)
-  [[ -f "$conf" ]] && chmod 600 "$conf" 2>/dev/null
-  ok "Remote '$REMOTE' is ready."
+  die "Not logged in to Proton. Log in with the web interface first (In)."
 }
 
 # --------------------------------------------------------------------- navigation
@@ -502,7 +408,7 @@ main() {
   ensure_remote
   ok "Connected to ${B}${REMOTE}:${R} using $("$RCLONE_BIN" version | head -1)"
 
-  load_listing || die "Could not read the remote. Check your credentials with: $RCLONE_BIN config"
+  load_listing || die "Could not read the remote. Check the login in the web interface."
 
   local cmd
   while true; do

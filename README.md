@@ -31,7 +31,7 @@ Without `up.sh`: `docker compose up -d --build`, Then Open The Link
   Are Off By Default And Need `DELETE`.
 - **Conflict Policies**: Overwrite If Different, Skip Existing, Overwrite If
   Newer, Keep Both (`name.old-<time>.ext`).
-- **Terminal**: `docker compose exec pdrive pdrive` Or `pdrive` After `install.sh`.
+- **Terminal**: `docker compose exec pdrive pdrive`.
 
 ## Safety
 
@@ -44,16 +44,14 @@ Without `up.sh`: `docker compose up -d --build`, Then Open The Link
   Logging Out Does Not Revoke The Session On Proton's Side.
 - A Wrong Login Can Trigger HTTP 429 From Proton: Wait A Few Minutes.
 
-## Without Docker
+## Self-Check
 
 ```bash
-./install.sh             # rclone (Checksum Verified), pdrive, pdrive-web
-pdrive-web               # Web Interface
-pdrive                   # Terminal
+docker compose exec pdrive pdrive-selftest
 ```
 
-`pdrive-selftest` Checks How Your Drive Behaves (Session, Modification Times,
-Keep Both, Listing Speed) With A Throwaway Folder.
+Checks How Your Drive Behaves (Session, Modification Times, Keep Both, Listing
+Speed) With A Throwaway Folder On Your Drive, Then Deletes It.
 
 ## Configuration
 
@@ -63,12 +61,11 @@ Keep Both, Listing Speed) With A Throwaway Folder.
 | `PUID`, `PGID` | Owner Of Downloaded Files |
 | `PDRIVE_PORT` | Host Port (Default 8765) |
 | `PDRIVE_KEY` | Fixed Access Key |
-| `PDRIVE_REMOTE`, `PDRIVE_RCLONE`, `PDRIVE_LOCAL` | Remote Name, rclone Binary, Default Local Folder (Without Docker) |
 
 ## Tests
 
 ```bash
-tests/run.sh             # Needs rclone On PATH Or REAL_RCLONE=/path/to/rclone
+tests/run.sh             # Runs Inside The Docker Image, Needs Only Docker
 ```
 
 The Proton Login Is Faked And Transfers Use A Local Folder: Your Drive Is Never

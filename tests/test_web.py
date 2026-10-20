@@ -93,7 +93,7 @@ class Server(unittest.TestCase):
         env = dict(os.environ, PDRIVE_RCLONE=str(ROOT / "tests/fake_rclone"), REAL_RCLONE=REAL,
                    FAKE_STATE=str(cls.state), FAKE_DRIVE=str(cls.drive), HOME=str(cls.home),
                    PDRIVE_LOCAL_ROOT=str(cls.root), PDRIVE_KEY="testkey", PDRIVE_REMOTE="proton")
-        cls.proc = subprocess.Popen([sys.executable, str(ROOT / "pdrive-web"), "--no-browser",
+        cls.proc = subprocess.Popen([sys.executable, str(ROOT / "pdrive-web"),
                                      "--port", str(cls.port)], env=env, stdout=subprocess.DEVNULL)
         for _ in range(50):
             try:

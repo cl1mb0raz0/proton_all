@@ -28,4 +28,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["python3", "-c", "import urllib.request as u, urllib.error as e\ntry:\n u.urlopen('http://127.0.0.1:8765/api/status', timeout=3)\nexcept e.HTTPError:\n pass"]
 VOLUME ["/config"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["pdrive-web", "--no-browser"]
+CMD ["pdrive-web"]
